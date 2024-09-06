@@ -1,6 +1,7 @@
 # for out-of-tree build support
 SRC_DIR := $(dir $(firstword $(MAKEFILE_LIST)))
 VPATH := $(SRC_DIR)
+CMAKE := cmake
 YOSYS_CONFIG := $(YOSYS_PREFIX)yosys-config
 SRCS = $(wildcard $(SRC_DIR)/src/*.cc)
 OBJS = $(patsubst $(SRC_DIR)/src/%.cc,build/%.o,$(SRCS))
@@ -18,7 +19,7 @@ configure-slang:
 		echo ""; \
 		exit 1; \
 	fi
-	cmake -S $(SRC_DIR)/third_party/slang -B build/slang \
+	$(CMAKE) -S $(SRC_DIR)/third_party/slang -B build/slang \
 		-DCMAKE_INSTALL_PREFIX=build/slang_install \
 		-DSLANG_INCLUDE_TESTS=OFF \
 		-DSLANG_INCLUDE_TOOLS=OFF \

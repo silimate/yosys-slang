@@ -207,6 +207,7 @@ SigSpec RTLILBuilder::Biop(IdString op, SigSpec a, SigSpec b,
 		OP(sub)
 		OP(mul)
 		OP(divfloor)
+		OP(div)
 		OP(mod)
 		OP(and)
 		OP(or)
@@ -237,8 +238,11 @@ SigSpec RTLILBuilder::Biop(IdString op, SigSpec a, SigSpec b,
 
 	if (op == ID($logic_or)) {
 		// IMPROVEMENT: condition could be relaxed
-		if ((a.is_fully_const() && a.as_bool()) || (b.is_fully_const() && b.as_bool()))
-			return SigSpec(RTLIL::S0, y_width);
+		if ((a.is_fully_const() && a.as_bool()) || (b.is_fully_const() && b.as_bool())) {
+			SigSpec ret = {RTLIL::S1};
+			ret.extend_u0(y_width);
+			return ret;
+		}
 	}
 
 	Cell *cell = canvas->addCell(NEW_ID, op);
@@ -248,6 +252,30 @@ SigSpec RTLILBuilder::Biop(IdString op, SigSpec a, SigSpec b,
 	cell->setParam(RTLIL::ID::B_WIDTH, b.size());
 	cell->setParam(RTLIL::ID::A_SIGNED, a_signed);
 	cell->setParam(RTLIL::ID::B_SIGNED, b_signed);
+	cell->setParam(RTLIL::ID::Y_WIDTH, y_width);
+	SigSpec ret = canvas->addWire(NEW_ID, y_width);
+	cell->setPort(RTLIL::ID::Y, ret);
+	return ret;
+}
+
+SigSpec RTLILBuilder::Unop(IdString op, SigSpec a, bool a_signed, int y_width)
+{
+	if (a.is_fully_const()) {
+#define OP(type) if (op == ID($##type)) return RTLIL::const_##type(a.as_const(), {}, a_signed, false, y_width);
+		OP(neg)
+		OP(logic_not)
+		OP(not)
+		OP(reduce_or)
+		OP(reduce_and)
+		OP(reduce_xor)
+		OP(reduce_xnor)
+#undef OP
+	}
+
+	Cell *cell = canvas->addCell(NEW_ID, op);
+	cell->setPort(RTLIL::ID::A, a);
+	cell->setParam(RTLIL::ID::A_WIDTH, a.size());
+	cell->setParam(RTLIL::ID::A_SIGNED, a_signed);
 	cell->setParam(RTLIL::ID::Y_WIDTH, y_width);
 	SigSpec ret = canvas->addWire(NEW_ID, y_width);
 	cell->setPort(RTLIL::ID::Y, ret);

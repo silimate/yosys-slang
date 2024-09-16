@@ -7,6 +7,7 @@
 #include "slang/ast/ASTVisitor.h"
 #include "slang/ast/Compilation.h"
 #include "slang/ast/EvalContext.h"
+#include "slang/ast/SystemSubroutine.h"
 #include "slang/diagnostics/DiagnosticEngine.h"
 #include "slang/diagnostics/TextDiagnosticClient.h"
 #include "slang/driver/Driver.h"
@@ -668,6 +669,15 @@ public:
 		const ast::Expression *raw_lexpr = &assign.left();
 		RTLIL::SigSpec raw_mask = RTLIL::SigSpec(RTLIL::S1, rvalue.size()), raw_rvalue = rvalue;
 
+		if (raw_lexpr->kind == ast::ExpressionKind::Streaming) {
+			auto& stream_lexpr = raw_lexpr->as<ast::StreamingConcatenationExpression>();
+			RTLIL::SigSpec lvalue = eval.streaming(stream_lexpr, true);
+			log_assert(rvalue.size() >= lvalue.size()); // should have been checked by slang
+			do_simple_assign(assign.sourceRange.start(), lvalue,
+							 rvalue.extract_end(rvalue.size() - lvalue.size()), blocking);
+			return;
+		}
+
 		bool finished_etching = false;
 		bool memory_write = false;
 		while (!finished_etching) {
@@ -1293,6 +1303,7 @@ RTLIL::Wire *SignalEvalContext::wire(const ast::Symbol &symbol)
 
 RTLIL::SigSpec SignalEvalContext::lhs(const ast::Expression &expr)
 {
+	log_assert(expr.kind != ast::ExpressionKind::Streaming);
 	require(expr, expr.type->isFixedSize());
 	RTLIL::SigSpec ret;
 
@@ -1396,14 +1407,68 @@ RTLIL::SigSpec SignalEvalContext::operator()(ast::Symbol const &symbol)
 	}
 }
 
+RTLIL::SigSpec SignalEvalContext::streaming(ast::StreamingConcatenationExpression const &expr, bool in_lhs)
+{
+	require(expr, expr.isFixedSize());
+	RTLIL::SigSpec cat;
+
+	for (auto stream : expr.streams()) {
+		require(*stream.operand, !stream.withExpr);
+		auto& op = *stream.operand;
+		RTLIL::SigSpec item;
+
+		if (op.kind == ast::ExpressionKind::Streaming)
+			item = streaming(op.as<ast::StreamingConcatenationExpression>(), in_lhs);
+		else
+			item = in_lhs ? lhs(*stream.operand) : (*this)(*stream.operand);
+
+		cat = {cat, item};
+	}
+
+	require(expr, expr.getSliceSize() <= std::numeric_limits<int>::max());
+	int slice = expr.getSliceSize();
+	if (slice == 0) {
+		return cat;
+	} else {
+		RTLIL::SigSpec reorder;
+		for (int i = 0; i < cat.size(); i += slice)
+			reorder = {reorder, cat.extract(i, std::min(slice, cat.size() - i))};
+		return reorder;
+	}
+}
+
+RTLIL::SigSpec SignalEvalContext::apply_conversion(const ast::ConversionExpression &conv, RTLIL::SigSpec op)
+{
+	const ast::Type &from = conv.operand().type->getCanonicalType();
+	const ast::Type &to = conv.type->getCanonicalType();
+
+	log_assert(op.size() == from.getBitstreamWidth());
+
+	if (from.isIntegral() && to.isIntegral()) {
+		op.extend_u0((int) to.getBitWidth(), to.isSigned());
+		return op;
+	} else if (from.isBitstreamType() && to.isBitstreamType()) {
+		require(conv, from.getBitstreamWidth() == to.getBitstreamWidth());
+		return op;
+	} else {
+		unimplemented(conv);
+	}
+}
+
 RTLIL::SigSpec SignalEvalContext::operator()(ast::Expression const &expr)
 {
+	log_assert(expr.kind != ast::ExpressionKind::Streaming);
 	require(expr, expr.type->isVoid() || expr.type->isFixedSize());
 	RTLIL::Module *mod = netlist.canvas;
 	RTLIL::SigSpec ret;
 	size_t repl_count;
 
-	{
+	if (/* flag for testing */ !ignore_ast_constants ||
+			expr.kind == ast::ExpressionKind::IntegerLiteral ||
+			expr.kind == ast::ExpressionKind::RealLiteral ||
+			expr.kind == ast::ExpressionKind::UnbasedUnsizedIntegerLiteral ||
+			expr.kind == ast::ExpressionKind::NullLiteral ||
+			expr.kind == ast::ExpressionKind::StringLiteral) {
 		auto const_result = expr.eval(this->const_);
 		if (const_result) {
 			ret = convert_const(const_result);
@@ -1416,9 +1481,16 @@ RTLIL::SigSpec SignalEvalContext::operator()(ast::Expression const &expr)
 		{
 			auto &assign = expr.as<ast::AssignmentExpression>();
 			require(expr, procedural != nullptr);
-			RTLIL::SigSpec lvalue_save = lvalue;
-			lvalue = (*this)(assign.left());
+			const ast::Expression *lvalue_save = lvalue;
+			lvalue = &assign.left();
 			procedural->assign_rvalue(assign, ret = (*this)(assign.right()));
+
+			// TODO: this is a fixup for a specific scenario, we need to
+			// check if there isn't some other general handling of return
+			// values we should be doing
+			if (assign.left().kind == ast::ExpressionKind::Streaming)
+				ret = {};
+
 			lvalue = lvalue_save;
 			break;
 		}
@@ -1487,24 +1559,17 @@ RTLIL::SigSpec SignalEvalContext::operator()(ast::Expression const &expr)
 			case ast::UnaryOperator::BitwiseNand: type = ID($reduce_and); invert = true; break;
 			case ast::UnaryOperator::BitwiseNor: type = ID($reduce_or); invert = true; break;
 			case ast::UnaryOperator::BitwiseXor: type = ID($reduce_xor); break;
+			case ast::UnaryOperator::BitwiseXnor: type = ID($reduce_xnor); break;
 			default:
 				unimplemented(unop);
 			}
 
-			RTLIL::Cell *cell = mod->addCell(NEW_ID, type);
-			cell->setPort(RTLIL::ID::A, left);
-			cell->setParam(RTLIL::ID::A_WIDTH, left.size());
-			cell->setParam(RTLIL::ID::A_SIGNED, unop.operand().type->isSigned());
-			cell->setParam(RTLIL::ID::Y_WIDTH, expr.type->getBitstreamWidth());
-			ret = mod->addWire(NEW_ID, expr.type->getBitstreamWidth());
-			cell->setPort(RTLIL::ID::Y, ret);
-			transfer_attrs(unop, cell);
+			ret = netlist.Unop(
+				type, left, unop.operand().type->isSigned(), expr.type->getBitstreamWidth()
+			);
 
-			if (invert) {
-				RTLIL::SigSpec new_ret = mod->addWire(NEW_ID, 1);
-				transfer_attrs(unop, mod->addLogicNot(NEW_ID, ret, new_ret));
-				ret = new_ret;
-			}
+			if (invert)
+				ret = netlist.LogicNot(ret);
 		}
 		break;
 	case ast::ExpressionKind::BinaryOp:
@@ -1521,8 +1586,8 @@ RTLIL::SigSpec SignalEvalContext::operator()(ast::Expression const &expr)
 			case ast::BinaryOperator::Add:      type = ID($add); break;
 			case ast::BinaryOperator::Subtract: type = ID($sub); break;
 			case ast::BinaryOperator::Multiply:	type = ID($mul); break;
-			case ast::BinaryOperator::Divide:	type = ID($divfloor); break; // TODO: check
-			case ast::BinaryOperator::Mod:		type = ID($mod); break; // TODO: check
+			case ast::BinaryOperator::Divide:	type = ID($div); break;
+			case ast::BinaryOperator::Mod:		type = ID($mod); break;
 			case ast::BinaryOperator::BinaryAnd: type = ID($and); break;
 			case ast::BinaryOperator::BinaryOr:	type = ID($or); break;
 			case ast::BinaryOperator::BinaryXor:	type = ID($xor); break;
@@ -1539,8 +1604,8 @@ RTLIL::SigSpec SignalEvalContext::operator()(ast::Expression const &expr)
 			//case ast::BinaryOperator::WildcardInequality;
 			case ast::BinaryOperator::LogicalAnd:	type = ID($logic_and); break;
 			case ast::BinaryOperator::LogicalOr:	type = ID($logic_or); break;
-			case ast::BinaryOperator::LogicalImplication: type = ID($logic_or); left = mod->LogicNot(NEW_ID, left); a_signed = false; break;
-			case ast::BinaryOperator::LogicalEquivalence: type = ID($eq); left = mod->ReduceBool(NEW_ID, left); right = mod->ReduceBool(NEW_ID, right); a_signed = b_signed = false; break;
+			case ast::BinaryOperator::LogicalImplication: type = ID($logic_or); left = netlist.LogicNot(left); a_signed = false; break;
+			case ast::BinaryOperator::LogicalEquivalence: type = ID($eq); left = netlist.ReduceBool(left); right = netlist.ReduceBool(right); a_signed = b_signed = false; break;
 			case ast::BinaryOperator::LogicalShiftLeft:	type = ID($shl); break;
 			case ast::BinaryOperator::LogicalShiftRight:	type = ID($shr); break;
 			case ast::BinaryOperator::ArithmeticShiftLeft:	type = ID($sshl); break;
@@ -1565,12 +1630,20 @@ RTLIL::SigSpec SignalEvalContext::operator()(ast::Expression const &expr)
 	case ast::ExpressionKind::Conversion:
 		{
 			const ast::ConversionExpression &conv = expr.as<ast::ConversionExpression>();
-			const ast::Type &from = conv.operand().type->getCanonicalType();
-			const ast::Type &to = conv.type->getCanonicalType();
-			require(expr, from.isIntegral() /* && from.isScalar() */);
-			require(expr, to.isIntegral() /* && to.isScalar() */);
-			ret = (*this)(conv.operand());
-			ret.extend_u0((int) to.getBitWidth(), to.isSigned());
+			if (conv.operand().kind != ast::ExpressionKind::Streaming) {
+				ret = apply_conversion(conv, (*this)(conv.operand()));
+			} else {
+				const ast::Type &to = conv.type->getCanonicalType();
+				log_assert(to.isBitstreamType());
+
+				// evaluate the bitstream
+				auto &stream_expr = conv.operand().as<ast::StreamingConcatenationExpression>();
+				RTLIL::SigSpec stream = streaming(stream_expr, false);
+
+				// pad to fit target size
+				log_assert(stream.size() <= expr.type->getBitstreamWidth());
+				ret = {stream, RTLIL::SigSpec(RTLIL::S0, expr.type->getBitstreamWidth() - stream.size())};
+			}
 		}
 		break;
 	case ast::ExpressionKind::IntegerLiteral:
@@ -1706,6 +1779,7 @@ RTLIL::SigSpec SignalEvalContext::operator()(ast::Expression const &expr)
 					UpdateTiming implicit;
 					// TODO: better scope here
 					ProceduralVisitor visitor(netlist, nullptr, implicit, ProceduralVisitor::ContinuousAssign);
+					visitor.eval.ignore_ast_constants = ignore_ast_constants;
 					ret = visitor.handle_call(call);
 
 					RTLIL::Process *proc = netlist.canvas->addProcess(NEW_ID);
@@ -1716,7 +1790,8 @@ RTLIL::SigSpec SignalEvalContext::operator()(ast::Expression const &expr)
 		}
 		break;
 	case ast::ExpressionKind::LValueReference:
-		ret = lvalue;
+		log_assert(lvalue != nullptr);
+		ret = (*this)(*lvalue);
 		break;
 	default:
 		unimplemented(expr);
@@ -2103,11 +2178,25 @@ public:
 				RTLIL::SigSpec signal;
 				if (expr.kind == ast::ExpressionKind::Assignment) {
 					auto &assign = expr.as<ast::AssignmentExpression>();
-					require(expr, assign.right().kind == ast::ExpressionKind::EmptyArgument ||
-								(assign.right().kind == ast::ExpressionKind::Conversion &&
-								 assign.right().as<ast::ConversionExpression>().operand().kind == ast::ExpressionKind::EmptyArgument));
+					ast::Expression const *right = &assign.right();
+
 					signal = netlist.eval.lhs(assign.left());
 					assert_nonstatic_free(signal);
+
+					while (right->kind == ast::ExpressionKind::Conversion) {
+						auto &conv = right->as<ast::ConversionExpression>();
+
+						// assign converted value to the target
+						RTLIL::Wire *temporary = netlist.canvas->addWire(NEW_ID,
+												conv.operand().type->getBitstreamWidth());
+						netlist.canvas->connect(signal, netlist.eval.apply_conversion(conv, temporary));
+
+						// set pre-converted value for new target
+						signal = temporary;
+						right = &conv.operand();
+					};
+
+					log_assert(right->kind == ast::ExpressionKind::EmptyArgument);
 				} else {
 					signal = netlist.eval(expr);
 				}
@@ -2181,41 +2270,40 @@ public:
 		}
 	}
 
-	void handle(const ast::InstanceBodySymbol &sym)
+	void add_internal_wires(const ast::InstanceBodySymbol &body)
 	{
-		RTLIL::Module *mod = netlist.canvas;
+		body.visit(ast::makeVisitor([&](auto&, const ast::ValueSymbol &sym) {
+			if (!sym.getType().isFixedSize())
+				return;
 
-		auto wadd = ast::makeVisitor([&](auto&, const ast::ValueSymbol &sym) {
-			if (sym.getType().isFixedSize()) {
-				if (sym.kind == ast::SymbolKind::Variable
-						|| sym.kind == ast::SymbolKind::Net
-						|| sym.kind == ast::SymbolKind::FormalArgument) {
+			if (sym.kind != ast::SymbolKind::Variable
+					&& sym.kind != ast::SymbolKind::Net
+					&& sym.kind != ast::SymbolKind::FormalArgument)
+				return;
 
-					if (sym.kind == ast::SymbolKind::Variable
-							&& sym.as<ast::VariableSymbol>().lifetime == ast::VariableLifetime::Automatic)
-						return;
+			if (sym.kind == ast::SymbolKind::Variable
+					&& sym.as<ast::VariableSymbol>().lifetime == ast::VariableLifetime::Automatic)
+				return;
 
-					std::string kind{ast::toString(sym.kind)};
-					log_debug("Adding %s (%s)\n", log_id(netlist.id(sym)), kind.c_str());
+			std::string kind{ast::toString(sym.kind)};
+			log_debug("Adding %s (%s)\n", log_id(netlist.id(sym)), kind.c_str());
 
-					if (is_inferred_memory(sym)) {
-						RTLIL::Memory *m = new RTLIL::Memory;
-						transfer_attrs(sym, m);
-						m->name = netlist.id(sym);
-						m->width = sym.getType().getArrayElementType()->getBitstreamWidth();
-						auto range = sym.getType().getFixedRange();
-						m->start_offset = range.lower();
-						m->size = range.width();
-						netlist.canvas->memories[m->name] = m;
-						netlist.emitted_mems[m->name] = {};
+			if (is_inferred_memory(sym)) {
+				RTLIL::Memory *m = new RTLIL::Memory;
+				transfer_attrs(sym, m);
+				m->name = netlist.id(sym);
+				m->width = sym.getType().getArrayElementType()->getBitstreamWidth();
+				auto range = sym.getType().getFixedRange();
+				m->start_offset = range.lower();
+				m->size = range.width();
+				netlist.canvas->memories[m->name] = m;
+				netlist.emitted_mems[m->name] = {};
 
-						log_debug("Memory inferred for variable %s (size: %d, width: %d)\n",
-								  log_id(m->name), m->size, m->width);
-					} else {
-						auto w = mod->addWire(netlist.id(sym), sym.getType().getBitstreamWidth());
-						transfer_attrs(sym, w);
-					}
-				}
+				log_debug("Memory inferred for variable %s (size: %d, width: %d)\n",
+						  log_id(m->name), m->size, m->width);
+			} else {
+				auto w = netlist.canvas->addWire(netlist.id(sym), sym.getType().getBitstreamWidth());
+				transfer_attrs(sym, w);
 			}
 		}, [&](auto&, const ast::InstanceSymbol&) {
 			/* do not descend into other modules */
@@ -2224,8 +2312,12 @@ public:
 			if (sym.isUninstantiated)
 				return;
 			visitor.visitDefault(sym);
-		});
-		sym.visit(wadd);
+		}));
+	}
+
+	void handle(const ast::InstanceBodySymbol &sym)
+	{
+		add_internal_wires(sym);
 
 		auto varinit = ast::makeVisitor([&](auto&, const ast::VariableSymbol &sym) {
 			slang::ConstantValue initval = nullptr;
@@ -2586,5 +2678,131 @@ struct UndrivenPass : Pass {
 		}
 	}
 } UndrivenPass;
+
+class TFunc : public ast::SystemSubroutine {
+public:
+    TFunc() : ast::SystemSubroutine("$t", ast::SubroutineKind::Function) {}
+
+    const ast::Type& checkArguments(const ast::ASTContext& context, const Args& args,
+									slang::SourceRange range, const ast::Expression*) const final {
+        auto& comp = context.getCompilation();
+        if (!checkArgCount(context, false, args, range, 1, 1))
+            return comp.getErrorType();
+        return comp.getVoidType();
+    }
+
+    slang::ConstantValue eval(ast::EvalContext& context, const Args&,
+    						  slang::SourceRange range,
+							  const ast::CallExpression::SystemCallInfo&) const final {
+        notConst(context, range);
+        return nullptr;
+    }
+};
+
+struct TestSlangExprPass : Pass {
+	TestSlangExprPass() : Pass("test_slangexpr", "test expression evaluation within slang frontend") {}
+
+	void help() override
+	{
+		log("Perform internal test of the slang frontend.\n");
+	}
+
+	void execute(std::vector<std::string> args, RTLIL::Design *d) override
+	{
+		log_header(d, "Executing TEST_SLANGEXPR pass.\n");
+
+		slang::driver::Driver driver;
+		driver.addStandardArgs();
+		SynthesisSettings settings;
+		settings.addOptions(driver.cmdLine);
+
+		{
+			std::vector<char *> c_args;
+			for (auto arg : args) {
+				char *c = new char[arg.size() + 1];
+				strcpy(c, arg.c_str());
+				c_args.push_back(c);
+			}
+			if (!driver.parseCommandLine(c_args.size(), &c_args[0]))
+				log_cmd_error("Bad command\n");
+		}
+		if (!driver.processOptions())
+			log_cmd_error("Bad command\n");
+
+		if (!driver.parseAllSources())
+			log_error("Parsing failed\n");
+		
+		auto compilation = driver.createCompilation();
+		auto tfunc = std::make_shared<TFunc>();
+		compilation->addSystemSubroutine(tfunc);
+
+		if (settings.dump_ast.value_or(false)) {
+			slang::JsonWriter writer;
+			writer.setPrettyPrint(true);
+			ast::ASTSerializer serializer(*compilation, writer);
+			serializer.serialize(compilation->getRoot());
+			std::cout << writer.view() << std::endl;
+		}
+
+		log_assert(compilation->getRoot().topInstances.size() == 1);
+		auto *top = compilation->getRoot().topInstances[0];
+		compilation->forceElaborate(top->body);
+
+		//if (compilation->hasIssuedErrors()) {
+			if (!driver.reportCompilation(*compilation, /* quiet */ false))
+				log_error("Compilation failed\n");
+		//}
+
+		global_compilation = &(*compilation);
+		global_sourcemgr = compilation->getSourceManager();
+		global_diagengine = &driver.diagEngine;
+		global_diagclient = driver.diagClient.get();
+		global_diagclient->clear();
+
+		NetlistContext netlist(d, *compilation, *top);
+		PopulateNetlist populate(netlist, settings);
+		populate.add_internal_wires(top->body);
+
+		SignalEvalContext amended_eval(netlist);
+		amended_eval.ignore_ast_constants = true;
+
+		int ntests = 0;
+		int nfailures = 0;
+
+		top->visit(ast::makeVisitor([&](auto&, const ast::SubroutineSymbol&) {
+			// ignore
+		}, [&](auto&, const ast::ExpressionStatement &stmt) {
+			assert(stmt.expr.kind == ast::ExpressionKind::Call);
+			auto &call = stmt.expr.as<ast::CallExpression>();
+			assert(call.getSubroutineName() == "$t");
+			auto expr = call.arguments()[0];
+
+			SigSpec ref = netlist.eval(*expr);
+			SigSpec test = amended_eval(*expr);
+
+			slang::SourceRange sr = expr->sourceRange;
+			std::string_view text = global_sourcemgr->getSourceText(sr.start().buffer()) \
+										.substr(sr.start().offset(), sr.end().offset() - sr.start().offset());
+
+			if (ref == test) {
+				log_debug("%s: %s (ref) == %s (test) # %s\n", format_src(*expr).c_str(),
+					log_signal(ref), log_signal(test),
+					std::string(text).c_str());
+				ntests++;
+			} else {
+				log("%s: %s (ref) == %s (test) # %s\n", format_src(*expr).c_str(),
+					log_signal(ref), log_signal(test),
+					std::string(text).c_str());
+				ntests++;
+				nfailures++;
+			}
+		}));
+
+		if (!nfailures)
+			log("%d tests passed.\n", ntests);
+		else
+			log_error("%d out of %d tests failed.\n", nfailures, ntests);
+	}
+} TestSlangExprPass;
 
 };

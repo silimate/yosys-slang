@@ -23,6 +23,8 @@ namespace slang {
 		class Statement;
 		class SignalEventControl;
 		class ProceduralBlockSymbol;
+		class StreamingConcatenationExpression;
+		class ConversionExpression;
 	};
 };
 
@@ -39,7 +41,7 @@ struct SignalEvalContext {
 	ProceduralVisitor *procedural;
 
 	ast::EvalContext const_;
-	RTLIL::SigSpec lvalue;
+	const ast::Expression *lvalue = nullptr;
 
 	struct Frame {
 		Yosys::dict<const ast::Symbol *, RTLIL::Wire *> locals;
@@ -59,16 +61,19 @@ struct SignalEvalContext {
 	void pop_frame();
 	RTLIL::Wire *wire(const ast::Symbol &symbol);
 
+	RTLIL::SigSpec apply_conversion(const ast::ConversionExpression &conv, RTLIL::SigSpec op);
+	RTLIL::SigSpec streaming(ast::StreamingConcatenationExpression const &expr, bool in_lhs);
+
 	RTLIL::SigSpec operator()(ast::Expression const &expr);
 	RTLIL::SigSpec operator()(ast::Symbol const &symbol);
 	RTLIL::SigSpec lhs(ast::Expression const &expr);
 	RTLIL::SigSpec eval_signed(ast::Expression const &expr);
 
-	std::pair<RTLIL::SigSpec, RTLIL::SigBit> translate_index(
-		const ast::Expression &expr, slang::ConstantRange range);
-
 	SignalEvalContext(NetlistContext &netlist);
 	SignalEvalContext(NetlistContext &netlist, ProceduralVisitor &procedural);
+
+	// for testing
+	bool ignore_ast_constants = false;
 };
 
 struct RTLILBuilder {
@@ -97,6 +102,7 @@ struct RTLILBuilder {
 	SigSpec Neg(SigSpec a, bool signed_);
 	SigSpec Not(SigSpec a);
 
+	SigSpec Unop(RTLIL::IdString op, SigSpec a, bool a_signed, int y_width);
 	SigSpec Biop(RTLIL::IdString op, SigSpec a, SigSpec b,
 				 bool a_signed, bool b_signed, int y_width);
 

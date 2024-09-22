@@ -35,6 +35,23 @@ struct SynthesisSettings {
 	std::optional<bool> no_proc;
 	std::optional<bool> compat_mode;
 	std::optional<bool> keep_hierarchy;
+	std::optional<bool> best_effort_hierarchy;
+	std::optional<bool> ignore_timing;
+
+	enum HierMode {
+		NONE,
+		BEST_EFFORT,
+		ALL
+	};
+
+	HierMode hierarchy_mode()
+	{
+		if (keep_hierarchy.value_or(false))
+			return ALL;
+		if (best_effort_hierarchy.value_or(false))
+			return BEST_EFFORT;
+		return NONE;
+	}
 
 	void addOptions(slang::CommandLine &cmdLine) {
 		cmdLine.add("--dump-ast", dump_ast, "Dump the AST");
@@ -43,6 +60,10 @@ struct SynthesisSettings {
 					"Be relaxed about the synthesis semantics of some language constructs");
 		cmdLine.add("--keep-hierarchy", keep_hierarchy,
 					"Keep hierarchy (experimental; may crash)");
+		cmdLine.add("--best-effort-hierarchy", best_effort_hierarchy,
+					"Keep hierarchy in a 'best effort' mode");
+		cmdLine.add("--ignore-timing", ignore_timing,
+		            "Ignore delays for synthesis");
 	}
 };
 
@@ -1218,6 +1239,14 @@ public:
 		}
 	}
 
+	void handle(const ast::TimedStatement &stmt)
+	{
+		if (netlist.settings.ignore_timing.value_or(false))
+			stmt.stmt.visit(*this);
+		else
+			unimplemented(stmt);
+	}
+
 	void handle(const ast::Statement &stmt)
 	{
 		unimplemented(stmt);
@@ -1319,7 +1348,8 @@ RTLIL::SigSpec SignalEvalContext::lhs(const ast::Expression &expr)
 				break;
 			}
 
-			if (symbol.kind == ast::SymbolKind::ModportPort) {
+			if (symbol.kind == ast::SymbolKind::ModportPort \
+					&& !netlist.scopes_remap.count(symbol.getParentScope())) {
 				ret = lhs(*symbol.as<ast::ModportPortSymbol>().getConnectionExpr());
 				break;
 			}
@@ -1373,6 +1403,12 @@ RTLIL::SigSpec SignalEvalContext::lhs(const ast::Expression &expr)
 RTLIL::SigSpec SignalEvalContext::operator()(ast::Symbol const &symbol)
 {
 	switch (symbol.kind) {
+	case ast::SymbolKind::ModportPort:
+		{
+			if (!netlist.scopes_remap.count(symbol.getParentScope()))
+				return (*this)(*symbol.as<ast::ModportPortSymbol>().getConnectionExpr());
+		}
+		[[fallthrough]];
 	case ast::SymbolKind::Net:
 	case ast::SymbolKind::Variable:
 	case ast::SymbolKind::FormalArgument:
@@ -1395,11 +1431,6 @@ RTLIL::SigSpec SignalEvalContext::operator()(ast::Symbol const &symbol)
 			auto exprconst = valsym.getInitializer()->constant;
 			require(valsym, exprconst && exprconst->isInteger());
 			return convert_svint(exprconst->integer());
-		}
-		break;
-	case ast::SymbolKind::ModportPort:
-		{
-			return (*this)(*symbol.as<ast::ModportPortSymbol>().getConnectionExpr());
 		}
 		break;
 	default:
@@ -1828,14 +1859,14 @@ struct PopulateNetlist : public TimingPatternInterpretor, public ast::ASTVisitor
 public:
 	NetlistContext &netlist;
 	SynthesisSettings &settings;
-	std::vector<const ast::InstanceSymbol *> deferred_modules;
+	std::vector<NetlistContext> deferred_modules;
 
 	struct InitialEvalVisitor : SlangInitial::EvalVisitor {
 		RTLIL::Module *mod;
 		int print_priority;
 
-		InitialEvalVisitor(ast::Compilation *compilation, RTLIL::Module *mod)
-			: SlangInitial::EvalVisitor(compilation), mod(mod), print_priority(0) {}
+		InitialEvalVisitor(ast::Compilation *compilation, RTLIL::Module *mod, bool ignore_timing=false)
+			: SlangInitial::EvalVisitor(compilation, ignore_timing), mod(mod), print_priority(0) {}
 
 		void handleDisplay(const slang::ast::CallExpression &call, const std::vector<slang::ConstantValue> &args) {
 			auto cell = mod->addCell(NEW_ID, ID($print));
@@ -1878,8 +1909,8 @@ public:
 		}
 	} initial_eval;
 
-	PopulateNetlist(NetlistContext &netlist, SynthesisSettings &settings)
-		: netlist(netlist), settings(settings), initial_eval(&netlist.compilation, netlist.canvas) {}
+	PopulateNetlist(NetlistContext &netlist)
+		: netlist(netlist), settings(netlist.settings), initial_eval(&netlist.compilation, netlist.canvas, netlist.settings.ignore_timing.value_or(false)) {}
 
 	void handle_comb_like_process(const ast::ProceduralBlockSymbol &symbol, const ast::Statement &body)
 	{
@@ -2132,17 +2163,6 @@ public:
 		unimplemented(sym);
 	}
 
-	void handle(const ast::InterfacePortSymbol &sym)
-	{
-		if (sym.getParentScope()->getContainingInstance() != &netlist.realm) {
-			// If the port is on a module boundary which we are flattening within the
-			// front end, then it doesn't need any special handling.
-			return;
-		}
-
-		unimplemented(sym);
-	}
-
 	void inline_port_connection(const ast::PortSymbol &port, RTLIL::SigSpec signal)
 	{
 		require(port, !port.isNullPort);
@@ -2167,7 +2187,40 @@ public:
 
 	void handle(const ast::InstanceSymbol &sym)
 	{
-		if (/* should dissolve */ !settings.keep_hierarchy.value_or(false)) {
+		bool should_dissolve;
+
+		switch (settings.hierarchy_mode()) {
+		case SynthesisSettings::NONE:
+			should_dissolve = true;
+			break;
+		case SynthesisSettings::BEST_EFFORT: {
+				should_dissolve = false;
+				for (auto *conn : sym.getPortConnections()) {
+					switch (conn->port.kind) {
+					case ast::SymbolKind::Port:
+					case ast::SymbolKind::MultiPort:
+						break;
+					case ast::SymbolKind::InterfacePort:
+						if (!conn->getIfaceConn().second)
+							should_dissolve = true;
+						break;
+					default:
+						should_dissolve = true;
+						break;
+					}
+				}
+
+				if (!sym.isModule())
+					should_dissolve = true;
+
+				break;
+			}
+		case SynthesisSettings::ALL:
+			should_dissolve = false;
+			break;
+		}
+
+		if (should_dissolve) {
 			sym.body.visit(*this);
 
 			for (auto *conn : sym.getPortConnections()) {
@@ -2217,26 +2270,70 @@ public:
 				}
 			}
 		} else {
-			require(sym, sym.isModule());
-			RTLIL::Cell *cell = netlist.canvas->addCell(netlist.id(sym), module_type_id(sym));
-			for (auto *conn : sym.getPortConnections()) {
-				if (!conn->getExpression())
-					continue;
-				auto &expr = *conn->getExpression();
-				RTLIL::SigSpec signal;
-				if (expr.kind == ast::ExpressionKind::Assignment) {
-					auto &assign = expr.as<ast::AssignmentExpression>();
-					require(expr, assign.right().kind == ast::ExpressionKind::EmptyArgument);
-					signal = netlist.eval.lhs(assign.left());
-					assert_nonstatic_free(signal);
-				} else {
-					signal = netlist.eval(expr);
-				}
-				cell->setPort(id(conn->port.name), signal);
-			}
-			transfer_attrs(sym, cell);
+			if (sym.isModule()) {
+				deferred_modules.emplace_back(netlist, sym);
+				NetlistContext &submodule = deferred_modules.back();
 
-			deferred_modules.push_back(&sym);
+				RTLIL::Cell *cell = netlist.canvas->addCell(netlist.id(sym), module_type_id(sym));
+				for (auto *conn : sym.getPortConnections()) {
+					switch (conn->port.kind) {
+					case ast::SymbolKind::Port: {
+						if (!conn->getExpression())
+							continue;
+						auto &expr = *conn->getExpression();
+						RTLIL::SigSpec signal;
+						if (expr.kind == ast::ExpressionKind::Assignment) {
+							auto &assign = expr.as<ast::AssignmentExpression>();
+							require(expr, assign.right().kind == ast::ExpressionKind::EmptyArgument);
+							signal = netlist.eval.lhs(assign.left());
+							assert_nonstatic_free(signal);
+						} else {
+							signal = netlist.eval(expr);
+						}
+						cell->setPort(id(conn->port.name), signal);
+						break;
+					}
+					case ast::SymbolKind::InterfacePort: {
+						require(sym, conn->getIfaceConn().second != nullptr && "must be a modport");
+						const ast::ModportSymbol &modport = *conn->getIfaceConn().second;
+						submodule.scopes_remap[&static_cast<const ast::Scope&>(modport)] =
+																		submodule.id(conn->port).str();
+
+						modport.visit(ast::makeVisitor([&](auto&, const ast::ModportPortSymbol &port) {
+							auto wire = submodule.add_wire(port);
+							log_assert(wire);
+							switch (port.direction) {
+							case ast::ArgumentDirection::In:
+								wire->port_input = true;
+								break;
+							case ast::ArgumentDirection::Out:
+								wire->port_output = true;
+								break;
+							case ast::ArgumentDirection::InOut:
+								wire->port_input = true;
+								wire->port_output = true;
+								break;
+							default:
+								unimplemented(port);
+							}
+							log_assert(port.internalSymbol);
+							cell->setPort(wire->name, netlist.wire(*port.internalSymbol));
+						}));
+						break;
+					}
+					default:
+						unimplemented(conn->port);
+					}
+					
+				}
+				transfer_attrs(sym, cell);
+
+			} else if (sym.isInterface()) {
+				log_assert(sym.getPortConnections().empty());
+				sym.body.visit(*this);
+			} else {
+				unimplemented(sym);
+			}
 		}
 	}
 
@@ -2302,8 +2399,7 @@ public:
 				log_debug("Memory inferred for variable %s (size: %d, width: %d)\n",
 						  log_id(m->name), m->size, m->width);
 			} else {
-				auto w = netlist.canvas->addWire(netlist.id(sym), sym.getType().getBitstreamWidth());
-				transfer_attrs(sym, w);
+				netlist.add_wire(sym);
 			}
 		}, [&](auto&, const ast::InstanceSymbol&) {
 			/* do not descend into other modules */
@@ -2405,6 +2501,7 @@ public:
 	void handle(const ast::VariableSymbol&) {}
 	void handle(const ast::EmptyMemberSymbol&) {}
 	void handle(const ast::ModportSymbol&) {}
+	void handle(const ast::InterfacePortSymbol&) {}
 
 	void handle(const ast::StatementBlockSymbol &sym)
 	{
@@ -2422,12 +2519,17 @@ public:
 	}
 };
 
-static void build_hierpath2(const ast::InstanceBodySymbol &realm,
+static void build_hierpath2(NetlistContext &netlist,
 							std::ostringstream &s, const ast::Scope *scope)
 {
 	if (!scope ||
-		static_cast<const ast::Scope *>(&realm) == scope)
+		static_cast<const ast::Scope *>(&netlist.realm) == scope)
 		return;
+
+	if (netlist.scopes_remap.count(scope)) {
+		s << netlist.scopes_remap.at(scope) << ".";
+		return;
+	}
 
 	const ast::Symbol *symbol = &scope->asSymbol();
 
@@ -2437,7 +2539,7 @@ static void build_hierpath2(const ast::InstanceBodySymbol &realm,
 		symbol = symbol->as<ast::CheckerInstanceBodySymbol>().parentInstance;
 
 	if (auto parent = symbol->getParentScope())
-		build_hierpath2(realm, s, parent);
+		build_hierpath2(netlist, s, parent);
 
 	if (symbol->kind == ast::SymbolKind::GenerateBlockArray) {
 		auto &array = symbol->as<ast::GenerateBlockArraySymbol>();
@@ -2470,9 +2572,16 @@ static void build_hierpath2(const ast::InstanceBodySymbol &realm,
 RTLIL::IdString NetlistContext::id(const ast::Symbol &symbol)
 {
 	std::ostringstream path;
-	build_hierpath2(realm, path, symbol.getParentScope());
+	build_hierpath2(*this, path, symbol.getParentScope());
 	path << symbol.name;
 	return RTLIL::escape_id(path.str());
+}
+
+RTLIL::Wire *NetlistContext::add_wire(const ast::ValueSymbol &symbol)
+{
+	auto w = canvas->addWire(id(symbol), symbol.getType().getBitstreamWidth());
+	transfer_attrs(symbol, w);
+	return w;
 }
 
 RTLIL::Wire *NetlistContext::wire(const ast::Symbol &symbol)
@@ -2484,9 +2593,10 @@ RTLIL::Wire *NetlistContext::wire(const ast::Symbol &symbol)
 
 NetlistContext::NetlistContext(
 		RTLIL::Design *design,
+		SynthesisSettings &settings,
 		ast::Compilation &compilation,
 		const ast::InstanceSymbol &instance)
-	: compilation(compilation), realm(instance.body), eval(*this)
+	: settings(settings), compilation(compilation), realm(instance.body), eval(*this)
 {
 	canvas = design->addModule(module_type_id(instance));
 	transfer_attrs(instance.body.getDefinition(), canvas);
@@ -2495,14 +2605,17 @@ NetlistContext::NetlistContext(
 NetlistContext::NetlistContext(
 		NetlistContext &other,
 		const ast::InstanceSymbol &instance)
-	: NetlistContext(other.canvas->design, other.compilation, instance)
+	: NetlistContext(other.canvas->design, other.settings, other.compilation, instance)
 {
 }
 
 NetlistContext::~NetlistContext()
 {
-	canvas->fixup_ports();
-	canvas->check();
+	// move constructor could have cleared our canvas pointer
+	if (canvas) {
+		canvas->fixup_ports();
+		canvas->check();
+	}
 }
 
 USING_YOSYS_NAMESPACE
@@ -2585,17 +2698,16 @@ struct SlangFrontend : Frontend {
 			memory_candidates = mem_detect.memory_candidates;
 
 			{
-				std::vector<const ast::InstanceSymbol *> queue;
+				std::vector<NetlistContext> queue;
 				for (auto instance : compilation->getRoot().topInstances)
-					queue.push_back(instance);
+					queue.emplace_back(design, settings, *compilation, *instance);
 
 				for (int i = 0; i < (int) queue.size(); i++) {
-					const ast::InstanceSymbol *instance = queue[i];
-					NetlistContext netlist(design, *compilation, *instance);
-					PopulateNetlist populate(netlist, settings);
-					instance->body.visit(populate);
-					queue.insert(queue.end(), populate.deferred_modules.begin(),
-								 populate.deferred_modules.end());
+					NetlistContext &netlist = queue[i];
+					PopulateNetlist populate(netlist);
+					netlist.realm.visit(populate);
+					std::move(populate.deferred_modules.begin(),
+						populate.deferred_modules.end(), std::back_inserter(queue));
 				}
 			}
 
@@ -2759,8 +2871,8 @@ struct TestSlangExprPass : Pass {
 		global_diagclient = driver.diagClient.get();
 		global_diagclient->clear();
 
-		NetlistContext netlist(d, *compilation, *top);
-		PopulateNetlist populate(netlist, settings);
+		NetlistContext netlist(d, settings, *compilation, *top);
+		PopulateNetlist populate(netlist);
 		populate.add_internal_wires(top->body);
 
 		SignalEvalContext amended_eval(netlist);

@@ -116,7 +116,9 @@ struct RTLILBuilder {
 	}
 };
 
+struct SynthesisSettings;
 struct NetlistContext : RTLILBuilder {
+	SynthesisSettings &settings;
 	ast::Compilation &compilation;
 	const slang::SourceManager &source_mgr();
 
@@ -133,6 +135,7 @@ struct NetlistContext : RTLILBuilder {
 	// Returns an ID string to use in the netlist to represent the given symbol.
 	RTLIL::IdString id(const ast::Symbol &sym);
 
+	RTLIL::Wire *add_wire(const ast::ValueSymbol &sym);
 	RTLIL::Wire *wire(const ast::Symbol &sym);
 
 	struct Memory {
@@ -140,7 +143,11 @@ struct NetlistContext : RTLILBuilder {
 	};
 	Yosys::dict<RTLIL::IdString, Memory> emitted_mems;
 
+	// Used to implement modports on uncollapsed levels of hierarchy
+	Yosys::dict<const ast::Scope*, std::string, Yosys::hash_ptr_ops> scopes_remap;
+
 	NetlistContext(RTLIL::Design *design,
+		SynthesisSettings &settings,
 		ast::Compilation &compilation,
 		const ast::InstanceSymbol &instance);
 
@@ -148,6 +155,22 @@ struct NetlistContext : RTLILBuilder {
 		const ast::InstanceSymbol &instance);
 
 	~NetlistContext();
+
+	NetlistContext(const NetlistContext&) = delete;
+	NetlistContext& operator=(const NetlistContext&) = delete;
+	NetlistContext(NetlistContext&& other)
+		: settings(other.settings), compilation(other.compilation),
+		  realm(other.realm), eval(*this)
+	{
+		log_assert(other.eval.procedural == nullptr);
+		log_assert(other.eval.lvalue == nullptr);
+		log_assert(other.eval.frames.empty());
+
+		emitted_mems.swap(other.emitted_mems);
+		scopes_remap.swap(other.scopes_remap);
+		canvas = other.canvas;
+		other.canvas = nullptr;
+	}
 };
 
 };

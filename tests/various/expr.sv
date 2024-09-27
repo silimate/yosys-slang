@@ -137,13 +137,13 @@ function [7:0] stream5();
 	{<<1{stream5}} = 8'hd6;
 endfunction
 function [7:0] stream6();
-	{<<1{stream6}} = 8'hd6;
+	{>>1{stream6}} = 9'h56;
 endfunction
 function [7:0] stream7();
-	{<<1{stream7}} = 8'hd6;
+	{<<2{stream7}} = 8'hd6;
 endfunction
 function [7:0] stream8();
-	{<<1{stream8}} = 8'hd6;
+	{>>2{stream8}} = 8'hd6;
 endfunction
 
 initial begin
@@ -155,5 +155,13 @@ end
 
 // nested streaming
 initial $t(byte_t'({>>3{4'h6, {>>2{4'h7}}}}));
+
+function automatic [7:0] f();
+    logic [4:0] data[2] = '{12, 43};
+	logic [4:0] a, b;
+	'{ a, b } = data;
+	return {a, b};
+endfunction
+initial $t(f());
 
 endmodule

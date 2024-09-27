@@ -102,3 +102,63 @@ module test_break07 (bits, encoded);
     output logic[2:0] encoded;
     priority_encoder2 #(8) test_7_inst (.*);
 endmodule
+
+module test_break08;
+    wire tie_down = 0;
+    logic out;
+
+    always_comb begin
+        for (int i = 0; i < 1; i++) begin
+            out = 1;
+            if (!tie_down)
+                break;
+            out = 0;
+        end
+    end
+
+    always_comb assert(out == 1);
+endmodule
+
+module test_break09(logic [2:0] span);
+    logic [7:0] mask1, mask2;
+
+    always_comb begin
+        mask1 = 0;
+        for (int i = 0; i < span && i < 8; i++)
+            mask1[i] = 1;
+    end
+
+    always_comb begin
+        mask2 = 0;
+        for (int i = 0; i < 8; i++)
+            if (i < span)
+                mask2[i] = 1;
+    end
+
+    always_comb begin
+        if (^span !== 'x)
+            assert(mask1 === mask2);
+    end
+endmodule
+
+module test_break10(logic [2:0] span);
+    logic [7:0] mask1, mask2;
+
+    always_comb begin
+        mask1 = 0;
+        for (int i = 0; i < span; i++)
+            mask1[i] = 1;
+    end
+
+    always_comb begin
+        mask2 = 0;
+        for (int i = 0; i < 8; i++)
+            if (i < span)
+                mask2[i] = 1;
+    end
+
+    always_comb begin
+        if (^span !== 'x)
+            assert(mask1 === mask2);
+    end
+endmodule

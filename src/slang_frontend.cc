@@ -37,6 +37,8 @@ struct SynthesisSettings {
 	std::optional<bool> keep_hierarchy;
 	std::optional<bool> best_effort_hierarchy;
 	std::optional<bool> ignore_timing;
+	std::optional<bool> ignore_initial;
+	std::optional<int> unroll_limit_;
 
 	enum HierMode {
 		NONE,
@@ -53,6 +55,10 @@ struct SynthesisSettings {
 		return NONE;
 	}
 
+	int unroll_limit() {
+		return unroll_limit_.value_or(4000);
+	}
+
 	void addOptions(slang::CommandLine &cmdLine) {
 		cmdLine.add("--dump-ast", dump_ast, "Dump the AST");
 		cmdLine.add("--no-proc", no_proc, "Disable lowering of processes");
@@ -64,6 +70,10 @@ struct SynthesisSettings {
 					"Keep hierarchy in a 'best effort' mode");
 		cmdLine.add("--ignore-timing", ignore_timing,
 		            "Ignore delays for synthesis");
+		cmdLine.add("--ignore-initial", ignore_initial,
+		            "Ignore initial blocks for synthesis");
+		cmdLine.add("--unroll-limit", unroll_limit_,
+		            "Set unrolling limit (default: 4000)", "<limit>");
 	}
 };
 
@@ -134,6 +144,7 @@ template<typename T>
 }
 #define require(obj, property) { if (!(property)) unimplemented_(obj, __FILE__, __LINE__, #property); }
 #define unimplemented(obj) { slang_frontend::unimplemented_(obj, __FILE__, __LINE__, NULL); }
+#define ast_invariant(obj, property) require(obj, property)
 
 };
 
@@ -403,7 +414,58 @@ std::string format_wchunk(RTLIL::SigChunk chunk)
 		return Yosys::stringf("%s[%d:%d]", chunk.wire->name.c_str(), chunk.offset, chunk.offset + chunk.width);
 }
 
-struct ProceduralVisitor : public ast::ASTVisitor<ProceduralVisitor, true, false> {
+class UnrollLimitTracking {
+	const ast::Scope *diag_scope;
+	int limit;
+	int unrolling = 0;
+	int unroll_counter = 0;
+	Yosys::pool<const ast::Statement *, Yosys::hash_ptr_ops> loops;
+	bool error_issued = false;
+
+public:
+	UnrollLimitTracking(const ast::Scope *diag_scope, int limit)
+		: diag_scope(diag_scope), limit(limit) {}
+
+	~UnrollLimitTracking() {
+		log_assert(!unrolling);
+	}
+
+	void enter_unrolling() {
+		if (!unrolling++) {
+			unroll_counter = 0;
+			error_issued = false;
+			loops.clear();
+		}
+	}
+
+	void exit_unrolling() {
+		unrolling--;
+		log_assert(unrolling >= 0);
+	}
+
+	bool unroll_tick(const ast::Statement *symbol) {
+		if (error_issued)
+			return false;
+
+		loops.insert(symbol);
+
+		if (++unroll_counter > limit) {
+			auto &diag = diag_scope->addDiag(diag::UnrollLimitExhausted, symbol->sourceRange);
+			diag << limit;
+			for (auto other_loop : loops) {
+				if (other_loop == symbol)
+					continue;
+				diag.addNote(diag::NoteLoopContributes, other_loop->sourceRange);
+			}
+			error_issued = true;
+			return false;
+		}
+
+		return true;
+	}
+};
+
+struct ProceduralVisitor : public ast::ASTVisitor<ProceduralVisitor, true, false>, public UnrollLimitTracking {
 public:
 	const ast::Scope *diag_scope;
 
@@ -427,7 +489,9 @@ public:
 
 	// TODO: revisit diag_scope
 	ProceduralVisitor(NetlistContext &netlist, const ast::Scope *diag_scope, UpdateTiming &timing, Mode mode)
-			: diag_scope(diag_scope), netlist(netlist), eval(netlist, *this), timing(timing), mode(mode) {
+			: UnrollLimitTracking(diag_scope, netlist.settings.unroll_limit()),
+			  diag_scope(diag_scope), netlist(netlist), eval(netlist, *this),
+			  timing(timing), mode(mode) {
 		eval.push_frame();
 
 		root_case = new Case;
@@ -546,6 +610,8 @@ public:
 		Switch *sw;
 		VariableState &vstate;
 		VariableState::Map save_map;
+		std::vector<std::pair<Case *, RTLIL::SigSig>> branch_updates;
+		bool entered = false, finished = false;
 
 		SwitchHelper(Case *&current_case, VariableState &vstate, RTLIL::SigSpec signal)
 			: parent(current_case), current_case(current_case), vstate(vstate)
@@ -553,20 +619,41 @@ public:
 			sw = parent->add_switch(signal);
 		}
 
-		std::vector<std::pair<Case *, RTLIL::SigSig>> branch_updates;
+		~SwitchHelper()
+		{
+			log_assert(!entered);
+			log_assert(branch_updates.empty() || finished);
+		}
+
+		SwitchHelper(const SwitchHelper&) = delete;
+		SwitchHelper& operator=(const SwitchHelper&) = delete;
+		SwitchHelper(SwitchHelper&& other)
+			: parent(other.parent), current_case(other.current_case),
+			  sw(other.sw), vstate(other.vstate), entered(other.entered),
+			  finished(other.finished)
+		{
+			branch_updates.swap(other.branch_updates);
+			save_map.swap(other.save_map);
+			other.entered = false;
+			other.finished = false;
+		}
 
 		void enter_branch(std::vector<RTLIL::SigSpec> compare)
 		{
 			vstate.save(save_map);
+			log_assert(!entered);
 			log_assert(current_case == parent);
 			current_case = sw->add_case(compare);
+			entered = true;
 		}
 
 		void exit_branch()
 		{
+			log_assert(entered);
 			log_assert(current_case != parent);
 			Case *this_case = current_case;
 			current_case = parent;
+			entered = false;
 			auto updates = vstate.restore(save_map);
 			branch_updates.push_back(std::make_pair(this_case, updates));
 		}
@@ -622,6 +709,8 @@ public:
 					done += chunk.size();
 				}
 			}
+
+			finished = true;
 		}
 	};
 
@@ -686,6 +775,8 @@ public:
 
 	void assign_rvalue(const ast::AssignmentExpression &assign, RTLIL::SigSpec rvalue)
 	{
+		require(assign, !assign.timingControl || netlist.settings.ignore_timing.value_or(false));
+
 		bool blocking = !assign.isNonBlocking();
 		const ast::Expression *raw_lexpr = &assign.left();
 		RTLIL::SigSpec raw_mask = RTLIL::SigSpec(RTLIL::S1, rvalue.size()), raw_rvalue = rvalue;
@@ -697,7 +788,40 @@ public:
 			do_simple_assign(assign.sourceRange.start(), lvalue,
 							 rvalue.extract_end(rvalue.size() - lvalue.size()), blocking);
 			return;
+		} else if (raw_lexpr->kind == ast::ExpressionKind::SimpleAssignmentPattern) {
+			// break down into individual assignments
+			auto& pattern_lexpr = raw_lexpr->as<ast::SimpleAssignmentPatternExpression>();
+
+			int nbits_remaining = rvalue.size();
+			for (auto el : pattern_lexpr.elements()) {
+				log_assert(el->kind == ast::ExpressionKind::Assignment);
+				auto &inner_assign = el->as<ast::AssignmentExpression>();
+
+				const ast::Expression *rsymbol = &inner_assign.right();
+				while (rsymbol->kind == ast::ExpressionKind::Conversion)
+					rsymbol = &rsymbol->as<ast::ConversionExpression>().operand();
+				log_assert(rsymbol->kind == ast::ExpressionKind::EmptyArgument);
+				log_assert(rsymbol->type->isBitstreamType());
+				int relem_width = rsymbol->type->getBitstreamWidth();
+
+				log_assert(nbits_remaining >= relem_width);
+				RTLIL::SigSpec relem = rvalue.extract(nbits_remaining - relem_width, relem_width);
+				nbits_remaining -= relem_width;
+
+				assign_rvalue(inner_assign, eval.apply_nested_conversion(inner_assign.right(), relem));
+			}
+
+			log_assert(nbits_remaining == 0);
+			return;
 		}
+		assign_rvalue_inner(assign, raw_lexpr, raw_rvalue, raw_mask, blocking);
+	}
+
+	void assign_rvalue_inner(const ast::AssignmentExpression &assign, const ast::Expression *raw_lexpr,
+							 RTLIL::SigSpec raw_rvalue, RTLIL::SigSpec raw_mask, bool blocking)
+	{
+		log_assert(raw_mask.size() == (int) raw_lexpr->type->getBitstreamWidth());
+		log_assert(raw_rvalue.size() == (int) raw_lexpr->type->getBitstreamWidth());
 
 		bool finished_etching = false;
 		bool memory_write = false;
@@ -748,12 +872,24 @@ public:
 					raw_lexpr = &acc.value();
 				}
 				break;
+			case ast::ExpressionKind::Concatenation:
+				{
+					const auto &concat = raw_lexpr->as<ast::ConcatenationExpression>();
+					int base = raw_mask.size(), len;
+					for (auto op : concat.operands()) {
+						require(concat, op->type->isBitstreamType());
+						base -= (len = op->type->getBitstreamWidth());
+						log_assert(base >= 0);
+						assign_rvalue_inner(assign, op, raw_rvalue.extract(base, len), raw_mask.extract(base, len), blocking);
+					}
+					log_assert(base == 0);
+					return;
+				}
+				break;
 			default:
 				finished_etching = true;
 				break;
 			}
-			if (raw_mask.size() != (int) raw_lexpr->type->getBitstreamWidth())
-				unimplemented(assign);
 			log_assert(raw_mask.size() == (int) raw_lexpr->type->getBitstreamWidth());
 			log_assert(raw_rvalue.size() == (int) raw_lexpr->type->getBitstreamWidth());
 		}
@@ -807,9 +943,24 @@ public:
 
 	void handle(const ast::ImmediateAssertionStatement &stmt)
 	{
+		std::string flavor;
+		switch (stmt.assertionKind) {
+		case ast::AssertionKind::Assert:
+			flavor = "assert";
+			break;
+		case ast::AssertionKind::Assume:
+			flavor = "assume";
+			break;
+		case ast::AssertionKind::CoverProperty:
+			flavor = "cover";
+			break;
+		default:
+			unimplemented(stmt);
+		}
+
 		auto cell = netlist.canvas->addCell(NEW_ID, ID($check));
 		set_effects_trigger(cell);
-		cell->setParam(ID::FLAVOR, std::string("assert"));
+		cell->setParam(ID::FLAVOR, flavor);
 		cell->setParam(ID::FORMAT, std::string(""));
 		cell->setParam(ID::ARGS_WIDTH, 0);
 		cell->setParam(ID::PRIORITY, --effects_priority);
@@ -962,6 +1113,11 @@ public:
 
 			stmt->visit(*this);
 		}
+
+		for (auto it = sw_stack.rbegin(); it != sw_stack.rend(); it++) {
+			it->exit_branch();
+			it->finish(netlist);
+		}
 	}
 
 	void handle(const ast::ConditionalStatement &cond)
@@ -994,12 +1150,22 @@ public:
 
 	void handle(const ast::CaseStatement &stmt)
 	{
-		require(stmt, stmt.condition == ast::CaseStatementCondition::Normal ||
-					  stmt.condition == ast::CaseStatementCondition::WildcardJustZ ||
-					  stmt.condition == ast::CaseStatementCondition::Inside);
-		bool match_z = stmt.condition == ast::CaseStatementCondition::WildcardJustZ;
-		RTLIL::SigSpec dispatch = eval(stmt.expr);
+		bool match_x, match_z;
+		using Condition = ast::CaseStatementCondition;
+		switch (stmt.condition) {
+		case Condition::WildcardJustZ:
+			match_x = false;
+			match_z = true;
+			break;
+		case Condition::WildcardXOrZ:
+			match_x = match_z = true;
+			break;
+		default:
+			match_x = match_z = false;
+			break;
+		}
 
+		RTLIL::SigSpec dispatch = eval(stmt.expr);
 		SwitchHelper b(current_case, vstate,
 					   stmt.condition == ast::CaseStatementCondition::Inside ?
 					   RTLIL::SigSpec(RTLIL::S1) : dispatch);
@@ -1034,8 +1200,12 @@ public:
 				RTLIL::SigSpec compare = eval(*expr);
 				log_assert(compare.size() == dispatch.size());
 				require(stmt, !match_z || compare.is_fully_const());
-				if (match_z)
-					compare.replace(RTLIL::Sz, RTLIL::Sa);
+				for (int i = 0; i < compare.size(); i++) {
+					if (compare[i] == RTLIL::Sz && match_z)
+						compare[i] = RTLIL::Sa;
+					if (compare[i] == RTLIL::Sx && match_x)
+						compare[i] = RTLIL::Sa;
+				}
 				compares.push_back(compare);
 			}
 			require(stmt, !compares.empty());
@@ -1065,38 +1235,39 @@ public:
 	}
 
 	void handle(const ast::WhileLoopStatement &stmt) {
-		int ncycles = 0;
-
-		RTLIL::Wire *disable = add_nonstatic(NEW_ID_SUFFIX("disable"), 1);
-		do_simple_assign(stmt.sourceRange.start(), disable, RTLIL::S0, true);
+		RTLIL::Wire *break_ = add_nonstatic(NEW_ID_SUFFIX("break"), 1);
+		do_simple_assign(stmt.sourceRange.start(), break_, RTLIL::S0, true);
 
 		std::vector<SwitchHelper> sw_stack;
+		enter_unrolling();
 		while (true) {
 			RTLIL::SigSpec cv = netlist.ReduceBool(eval(stmt.cond));
-			RTLIL::SigSpec disable_rv = substitute_rvalue(disable);
-			RTLIL::SigSpec joint_disable = netlist.LogicOr(netlist.LogicNot(cv), disable_rv);
+			RTLIL::SigSpec break_rv = substitute_rvalue(break_);
+			RTLIL::SigSpec joint_break = netlist.LogicOr(netlist.LogicNot(cv), break_rv);
 
-			if (!joint_disable.is_fully_const()) {
-				auto &b = sw_stack.emplace_back(current_case, vstate, joint_disable);
+			if (!joint_break.is_fully_const()) {
+				auto &b = sw_stack.emplace_back(current_case, vstate, joint_break);
 				b.sw->statement = &stmt;
 				b.enter_branch({RTLIL::S0});
 				current_case->statement = &stmt.body;
 
 				// From a semantical POV the following is a no-op, but it allows us to
 				// do more constant folding.
-				do_simple_assign(slang::SourceLocation::NoLocation, disable, RTLIL::S0, true);
-			} else if (joint_disable.as_bool()) {
+				do_simple_assign(slang::SourceLocation::NoLocation, break_, RTLIL::S0, true);
+			} else if (joint_break.as_bool()) {
 				break;
 			} else {
-				log_assert(!joint_disable.as_bool());
+				log_assert(!joint_break.as_bool());
 			}
 
-			eval.push_frame(nullptr, disable);
+			eval.push_frame(nullptr).break_ = break_;
 			stmt.body.visit(*this);
 			eval.pop_frame();
 
-			ncycles++;
+			if (!unroll_tick(&stmt))
+				break;
 		}
+		exit_unrolling();
 
 		for (auto it = sw_stack.rbegin(); it != sw_stack.rend(); it++) {
 			it->exit_branch();
@@ -1110,54 +1281,54 @@ public:
 		for (auto init : stmt.initializers)
 			eval(*init);
 
-		int ncycles = 0;
-
 		if (!stmt.stopExpr) {
 			diag_scope->addDiag(diag::MissingStopCondition, stmt.sourceRange.start());
 			return;
 		}
 
-		RTLIL::Wire *disable = add_nonstatic(NEW_ID_SUFFIX("disable"), 1);
-		do_simple_assign(stmt.sourceRange.start(), disable, RTLIL::S0, true);
+		RTLIL::Wire *break_ = add_nonstatic(NEW_ID_SUFFIX("break"), 1);
+		do_simple_assign(stmt.sourceRange.start(), break_, RTLIL::S0, true);
 
 		std::vector<SwitchHelper> sw_stack;
+		enter_unrolling();
 		while (true) {
-			RTLIL::SigSpec cv = eval(*stmt.stopExpr);
+			RTLIL::SigSpec cv = netlist.ReduceBool(eval(*stmt.stopExpr));
+
 			if (!cv.is_fully_const()) {
-				auto& diag = diag_scope->addDiag(diag::ForLoopIndeterminate, stmt.sourceRange);
-				if (ncycles)
-					diag.addNote(diag::NoteUnrollCycles, slang::SourceLocation::NoLocation) << ncycles;
+				auto &b = sw_stack.emplace_back(current_case, vstate, cv);
+				b.sw->statement = &stmt;
+				b.enter_branch({RTLIL::S1});
+				current_case->statement = &stmt.body;
+			} else if (!cv.as_bool()) {
 				break;
+			} else {
+				log_assert(cv.as_bool());
 			}
 
-			if (!cv.as_const().as_bool())
-				break;
-
-			eval.push_frame(nullptr, disable);
+			eval.push_frame(nullptr).break_ = break_;
 			stmt.body.visit(*this);
 			eval.pop_frame();
 
-			RTLIL::SigSpec disable_rv = substitute_rvalue(disable);
-			if (!disable_rv.is_fully_const()) {
-				auto &b = sw_stack.emplace_back(current_case, vstate, disable_rv);
+			RTLIL::SigSpec break_rv = substitute_rvalue(break_);
+
+			if (!break_rv.is_fully_const()) {
+				auto &b = sw_stack.emplace_back(current_case, vstate, break_rv);
 				b.sw->statement = &stmt;
 				b.enter_branch({RTLIL::S0});
 				current_case->statement = &stmt.body;
-
-				// From a semantical POV the following is a no-op, but it allows us to
-				// do more constant folding.
-				do_simple_assign(slang::SourceLocation::NoLocation, disable, RTLIL::S0, true);
-			} else if (disable_rv.as_bool()) {
+			} else if (break_rv.as_bool()) {
 				break;
 			} else {
-				log_assert(!disable_rv.as_bool());
+				log_assert(!break_rv.as_bool());
 			}
 
 			for (auto step : stmt.steps)
 				eval(*step);
 
-			ncycles++;
+			if (!unroll_tick(&stmt))
+				break;
 		}
+		exit_unrolling();
 
 		for (auto it = sw_stack.rbegin(); it != sw_stack.rend(); it++) {
 			it->exit_branch();
@@ -1204,10 +1375,23 @@ public:
 
 	void handle(const ast::BreakStatement &brk)
 	{
-		log_assert(eval.frames.back().kind == Frame::LoopBody);
-		log_assert(eval.frames.back().disable != nullptr);
+		log_assert(!eval.frames.empty());
+		auto &frame = eval.frames.back();
+		log_assert(frame.kind == Frame::LoopBody);
+		log_assert(frame.disable != nullptr && frame.break_ != nullptr);
 
-		do_simple_assign(brk.sourceRange.start(), eval.frames.back().disable, RTLIL::S1, true);
+		do_simple_assign(brk.sourceRange.start(), frame.disable, RTLIL::S1, true);
+		do_simple_assign(brk.sourceRange.start(), frame.break_, RTLIL::S1, true);
+	}
+
+	void handle(const ast::ContinueStatement &brk)
+	{
+		log_assert(!eval.frames.empty());
+		auto &frame = eval.frames.back();
+		log_assert(frame.kind == Frame::LoopBody);
+		log_assert(frame.disable != nullptr && frame.break_ != nullptr);
+
+		do_simple_assign(brk.sourceRange.start(), frame.disable, RTLIL::S1, true);
 	}
 
 	void handle(const ast::ReturnStatement &stmt)
@@ -1258,7 +1442,7 @@ public:
 	}
 };
 
-void SignalEvalContext::push_frame(const ast::SubroutineSymbol *subroutine, RTLIL::Wire *disable)
+SignalEvalContext::Frame &SignalEvalContext::push_frame(const ast::SubroutineSymbol *subroutine)
 {
 	if (subroutine) {
 		std::string hier;
@@ -1272,19 +1456,15 @@ void SignalEvalContext::push_frame(const ast::SubroutineSymbol *subroutine, RTLI
 	auto &frame = frames.emplace_back();
 	frame.subroutine = subroutine;
 	if (frames.size() == 1) {
-		log_assert(!subroutine && !disable);
+		log_assert(!subroutine);
 		frame.kind = Frame::Implicit;
-		frame.disable = nullptr;
 	} else {
-		if (!disable) {
-			log_assert(procedural);
-			frame.disable = procedural->add_nonstatic(NEW_ID_SUFFIX("disable"), 1);
-			procedural->do_simple_assign(slang::SourceLocation::NoLocation, frame.disable, RTLIL::S0, true);
-		} else {
-			frame.disable = disable;
-		}
-		frame.kind = subroutine != nullptr ? Frame::FunctionBody : Frame::LoopBody;
+		frame.disable = procedural->add_nonstatic(NEW_ID_SUFFIX("disable"), 1);
+		procedural->do_simple_assign(slang::SourceLocation::NoLocation,
+									 frame.disable, RTLIL::S0, true);
+		frame.kind = (subroutine != nullptr) ? Frame::FunctionBody : Frame::LoopBody;
 	}
+	return frame;
 }
 
 void SignalEvalContext::create_local(const ast::Symbol *symbol)
@@ -1324,9 +1504,7 @@ RTLIL::Wire *SignalEvalContext::wire(const ast::Symbol &symbol)
 		}
 		require(symbol, false && "not found");
 	} else {
-		RTLIL::Wire *wire = netlist.canvas->wire(netlist.id(symbol));
-		log_assert(wire);
-		return wire;
+		return netlist.wire(symbol);
 	}
 }
 
@@ -1397,6 +1575,31 @@ RTLIL::SigSpec SignalEvalContext::lhs(const ast::Expression &expr)
 
 	log_assert(expr.type->isFixedSize());
 	log_assert(ret.size() == (int) expr.type->getBitstreamWidth());
+	return ret;
+}
+
+RTLIL::SigSpec SignalEvalContext::connection_lhs(ast::AssignmentExpression const &assign)
+{
+	ast_invariant(assign, !assign.timingControl);
+	const ast::Expression *rsymbol = &assign.right();
+
+	if (rsymbol->kind == ast::ExpressionKind::EmptyArgument) {
+		// early path
+		RTLIL::SigSpec ret = lhs(assign.left());
+		assert_nonstatic_free(ret);
+		return ret;
+	}
+
+	while (rsymbol->kind == ast::ExpressionKind::Conversion)
+		rsymbol = &rsymbol->as<ast::ConversionExpression>().operand();
+	log_assert(rsymbol->kind == ast::ExpressionKind::EmptyArgument);
+	log_assert(rsymbol->type->isBitstreamType());
+
+	RTLIL::SigSpec ret = netlist.canvas->addWire(NEW_ID, rsymbol->type->getBitstreamWidth());
+	netlist.GroupConnect(
+		lhs(assign.left()),
+		apply_nested_conversion(assign.right(), ret)
+	);
 	return ret;
 }
 
@@ -1486,6 +1689,19 @@ RTLIL::SigSpec SignalEvalContext::apply_conversion(const ast::ConversionExpressi
 	}
 }
 
+RTLIL::SigSpec SignalEvalContext::apply_nested_conversion(const ast::Expression &expr, RTLIL::SigSpec op)
+{
+	if (expr.kind == ast::ExpressionKind::EmptyArgument) {
+		return op;
+	} else if (expr.kind == ast::ExpressionKind::Conversion) {
+		auto &conv = expr.as<ast::ConversionExpression>();
+		RTLIL::SigSpec value = apply_nested_conversion(conv.operand(), op);
+		return apply_conversion(conv, value);
+	} else {
+		log_abort();
+	}
+}
+
 RTLIL::SigSpec SignalEvalContext::operator()(ast::Expression const &expr)
 {
 	log_assert(expr.kind != ast::ExpressionKind::Streaming);
@@ -1512,6 +1728,7 @@ RTLIL::SigSpec SignalEvalContext::operator()(ast::Expression const &expr)
 		{
 			auto &assign = expr.as<ast::AssignmentExpression>();
 			require(expr, procedural != nullptr);
+			require(expr, !assign.timingControl || netlist.settings.ignore_timing.value_or(false));
 			const ast::Expression *lvalue_save = lvalue;
 			lvalue = &assign.left();
 			procedural->assign_rvalue(assign, ret = (*this)(assign.right()));
@@ -2106,6 +2323,9 @@ public:
 	}
 
 	void handle_initial_process(const ast::ProceduralBlockSymbol &, const ast::Statement &body) {
+		if (settings.ignore_initial.value_or(false))
+			return;
+
 		auto result = body.visit(initial_eval);
 		if (result != ast::Statement::EvalResult::Success) {
 			for (auto& diag : initial_eval.context.getAllDiagnostics())
@@ -2220,6 +2440,9 @@ public:
 			break;
 		}
 
+		if (sym.isInterface())
+			should_dissolve = true;
+
 		if (should_dissolve) {
 			sym.body.visit(*this);
 
@@ -2284,9 +2507,7 @@ public:
 						RTLIL::SigSpec signal;
 						if (expr.kind == ast::ExpressionKind::Assignment) {
 							auto &assign = expr.as<ast::AssignmentExpression>();
-							require(expr, assign.right().kind == ast::ExpressionKind::EmptyArgument);
-							signal = netlist.eval.lhs(assign.left());
-							assert_nonstatic_free(signal);
+							signal = netlist.eval.connection_lhs(assign);
 						} else {
 							signal = netlist.eval(expr);
 						}
@@ -2316,8 +2537,11 @@ public:
 							default:
 								unimplemented(port);
 							}
-							log_assert(port.internalSymbol);
-							cell->setPort(wire->name, netlist.wire(*port.internalSymbol));
+							ast_invariant(port, port.internalSymbol);
+							if (netlist.scopes_remap.count(&modport))
+								cell->setPort(wire->name, netlist.wire(port));
+							else
+								cell->setPort(wire->name, netlist.wire(*port.internalSymbol));
 						}));
 						break;
 					}
@@ -2327,10 +2551,6 @@ public:
 					
 				}
 				transfer_attrs(sym, cell);
-
-			} else if (sym.isInterface()) {
-				log_assert(sym.getPortConnections().empty());
-				sym.body.visit(*this);
 			} else {
 				unimplemented(sym);
 			}
@@ -2339,7 +2559,9 @@ public:
 
 	void handle(const ast::ContinuousAssignSymbol &sym)
 	{
+		require(sym, !sym.getDelay() || settings.ignore_timing.value_or(false));
 		const ast::AssignmentExpression &expr = sym.getAssignment().as<ast::AssignmentExpression>();
+		ast_invariant(expr, !expr.timingControl);
 		RTLIL::SigSpec lhs = netlist.eval.lhs(expr.left());
 		assert_nonstatic_free(lhs);
 		netlist.canvas->connect(lhs, netlist.eval(expr.right()));		
@@ -2699,8 +2921,10 @@ struct SlangFrontend : Frontend {
 
 			{
 				std::vector<NetlistContext> queue;
-				for (auto instance : compilation->getRoot().topInstances)
+				for (auto instance : compilation->getRoot().topInstances) {
 					queue.emplace_back(design, settings, *compilation, *instance);
+					queue.back().canvas->attributes[ID::top] = 1;
+				}
 
 				for (int i = 0; i < (int) queue.size(); i++) {
 					NetlistContext &netlist = queue[i];

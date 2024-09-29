@@ -39,6 +39,7 @@ struct SynthesisSettings {
 	std::optional<bool> ignore_timing;
 	std::optional<bool> ignore_initial;
 	std::optional<int> unroll_limit_;
+	std::optional<bool> extern_modules;
 
 	enum HierMode {
 		NONE,
@@ -74,6 +75,10 @@ struct SynthesisSettings {
 		            "Ignore initial blocks for synthesis");
 		cmdLine.add("--unroll-limit", unroll_limit_,
 		            "Set unrolling limit (default: 4000)", "<limit>");
+		cmdLine.add("--extern-modules", extern_modules,
+		            "Import as an instantiable blackbox any module which was previously "
+		            "loaded into the current design by a Yosys command; this allows composing "
+		            "hierarchy of SystemVerilog and non-SystemVerilog modules");
 	}
 };
 
@@ -1826,6 +1831,29 @@ RTLIL::SigSpec SignalEvalContext::operator()(ast::Expression const &expr)
 			RTLIL::SigSpec left = (*this)(biop.left());
 			RTLIL::SigSpec right = (*this)(biop.right());
 
+			bool invert;
+			switch (biop.op) {
+			case ast::BinaryOperator::WildcardEquality:
+				invert = false;
+				if (0) {
+			case ast::BinaryOperator::WildcardInequality:
+				invert = true;
+				}
+				if (!right.is_fully_const()) {
+					// TODO: scope
+					netlist.realm.addDiag(diag::NonconstWildcardEq, expr.sourceRange);
+					ret = netlist.canvas->addWire(NEW_ID, expr.type->getBitstreamWidth());
+					return ret;
+				}
+				return netlist.Unop(
+					invert ? ID($logic_not) : ID($reduce_bool),
+					netlist.EqWildcard(left, right),
+					false, expr.type->getBitstreamWidth()
+				);
+			default:
+				break;
+			}
+
 			bool a_signed = biop.left().type->isSigned();
 			bool b_signed = biop.right().type->isSigned();
 
@@ -1848,8 +1876,6 @@ RTLIL::SigSpec SignalEvalContext::operator()(ast::Expression const &expr)
 			case ast::BinaryOperator::GreaterThan:		type = ID($gt); break;
 			case ast::BinaryOperator::LessThanEqual:	type = ID($le); break;
 			case ast::BinaryOperator::LessThan:			type = ID($lt); break;
-			//case ast::BinaryOperator::WildcardEquality;
-			//case ast::BinaryOperator::WildcardInequality;
 			case ast::BinaryOperator::LogicalAnd:	type = ID($logic_and); break;
 			case ast::BinaryOperator::LogicalOr:	type = ID($logic_or); break;
 			case ast::BinaryOperator::LogicalImplication: type = ID($logic_or); left = netlist.LogicNot(left); a_signed = false; break;
@@ -2405,8 +2431,51 @@ public:
 			netlist.canvas->connect(internal_signal, signal);
 	}
 
+	static bool has_blackbox_attribute(const ast::DefinitionSymbol &sym)
+	{
+		for (auto attr : sym.getParentScope()->getCompilation().getAttributes(sym)) {
+			if (attr->name == "blackbox"sv && !attr->getValue().isFalse())
+				return true;
+		}
+		return false;
+	}
+
 	void handle(const ast::InstanceSymbol &sym)
 	{
+		// blackboxes get special handling no matter the hierarchy mode
+		if (sym.isModule() && has_blackbox_attribute(sym.body.getDefinition())) {
+			RTLIL::Cell *cell = netlist.canvas->addCell(netlist.id(sym), RTLIL::escape_id(std::string(sym.body.name)));
+
+			for (auto *conn : sym.getPortConnections()) {
+				switch (conn->port.kind) {
+				case ast::SymbolKind::Port: {
+					if (!conn->getExpression())
+						continue;
+					auto &expr = *conn->getExpression();
+					RTLIL::SigSpec signal;
+					if (expr.kind == ast::ExpressionKind::Assignment) {
+							auto &assign = expr.as<ast::AssignmentExpression>();
+						signal = netlist.eval.connection_lhs(assign);
+					} else {
+						signal = netlist.eval(expr);
+					}
+					cell->setPort(id(conn->port.name), signal);
+					break;
+				}
+				default:
+					unimplemented(sym);
+				}
+			}
+
+			sym.body.visit(ast::makeVisitor([&](auto&, const ast::ParameterSymbol &symbol) {
+				cell->setParam(RTLIL::escape_id(std::string(symbol.name)), convert_const(symbol.getValue()));
+			}, [&](auto&, const ast::InstanceSymbol&) {
+				// no-op
+			}));
+			transfer_attrs(sym, cell);
+			return;
+		}
+
 		bool should_dissolve;
 
 		switch (settings.hierarchy_mode()) {
@@ -2888,6 +2957,9 @@ struct SlangFrontend : Frontend {
 				log_error("Parsing failed\n");
 
 			auto compilation = driver.createCompilation();
+
+			if (settings.extern_modules.value_or(false))
+				import_blackboxes_from_rtlil(*compilation, design);
 
 			if (settings.dump_ast.value_or(false)) {
 				slang::JsonWriter writer;
